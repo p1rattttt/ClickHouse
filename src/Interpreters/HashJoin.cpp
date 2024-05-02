@@ -1,6 +1,7 @@
 #include <any>
 #include <limits>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 #include <Columns/ColumnConst.h>
@@ -634,7 +635,9 @@ namespace
         const IColumn * asof_column [[maybe_unused]] = nullptr;
         if constexpr (is_asof_join)
             asof_column = key_columns.back();
-
+        for (const auto* column : key_columns) {
+            std::cerr << column->getName() << " INSErTING FROM BLOCK\n\n\n\n";
+        }
         auto key_getter = createKeyGetter<KeyGetter, is_asof_join>(key_columns, key_sizes);
 
         /// For ALL and ASOF join always insert values
@@ -837,11 +840,16 @@ bool HashJoin::addBlockToJoin(const Block & source_block_, bool check_limits)
 
         bool multiple_disjuncts = !table_join->oneDisjunct();
         const auto & onexprs = table_join->getClauses();
+        LOG_INFO(log, "CROSS JOIN IS INSERTING {}\n\n\n\n", onexprs.size());
         for (size_t onexpr_idx = 0; onexpr_idx < onexprs.size(); ++onexpr_idx)
         {
             ColumnRawPtrs key_columns;
-            for (const auto & name : onexprs[onexpr_idx].key_names_right)
+            for (const auto & name : onexprs[onexpr_idx].key_names_right) {
+                LOG_INFO(log, "NAME of right: {}", name);
                 key_columns.push_back(all_key_columns[name].get());
+            }
+
+            LOG_INFO(log, "ANALYZER {} {}\n", onexprs[onexpr_idx].analyzer_left_filter_condition_column_name, onexprs[onexpr_idx].analyzer_right_filter_condition_column_name);
 
             /// We will insert to the map only keys, where all components are not NULL.
             ConstNullMapPtr null_map{};
@@ -861,11 +869,13 @@ bool HashJoin::addBlockToJoin(const Block & source_block_, bool check_limits)
             ColumnUInt8::MutablePtr not_joined_map = nullptr;
             if (!multiple_disjuncts && isRightOrFull(kind) && join_mask_col.hasData())
             {
+                LOG_INFO(log, "Save blocks that do not hold conditions in ON section\n");
                 const auto & join_mask = join_mask_col.getData();
                 /// Save rows that do not hold conditions
                 not_joined_map = ColumnUInt8::create(rows, 0);
                 for (size_t i = 0, sz = join_mask->size(); i < sz; ++i)
                 {
+                    LOG_INFO(log, "SAVING JOIN MAKS {} {}\n", i, static_cast<int>((*join_mask)[i]));
                     /// Condition hold, do not save row
                     if ((*join_mask)[i])
                         continue;
@@ -878,6 +888,16 @@ bool HashJoin::addBlockToJoin(const Block & source_block_, bool check_limits)
                 }
             }
 
+            if (std::holds_alternative<MapsOne>(data->maps[onexpr_idx])) {
+                LOG_INFO(log, "HOLDS MAPSONE\n");
+            } else if (std::holds_alternative<MapsAll>(data->maps[onexpr_idx])) {
+                LOG_INFO(log, "HOLDS MAPSALL\n");
+            } else if (std::holds_alternative<MapsAsof>(data->maps[onexpr_idx])) {
+                LOG_INFO(log, "HOLDS MAPSASOF\n");
+            } else {
+                LOG_INFO(log, "BULLSHIT HAPPENS\n\n\n");
+            }
+            LOG_INFO(log, "INSERTING rows: {}\n", rows);
             bool is_inserted = false;
             if (kind != JoinKind::Cross)
             {
@@ -888,6 +908,7 @@ bool HashJoin::addBlockToJoin(const Block & source_block_, bool check_limits)
                         /// If mask is false constant, rows are added to hashmap anyway. It's not a happy-flow, so this case is not optimized
                         join_mask_col.getData(),
                         data->pool, is_inserted);
+                    LOG_INFO(log, "IN JOIN DISPATCH {}\n", size);
 
                     if (multiple_disjuncts)
                         used_flags.reinit<kind_, strictness_>(stored_block);
@@ -908,7 +929,7 @@ bool HashJoin::addBlockToJoin(const Block & source_block_, bool check_limits)
                 data->blocks_nullmaps_allocated_size += not_joined_map->allocatedBytes();
                 data->blocks_nullmaps.emplace_back(stored_block, std::move(not_joined_map));
             }
-
+            LOG_INFO(log, "CROSS JOIN IS INSERTED {}\n\n\n\n\n\n", is_inserted);
             if (!multiple_disjuncts && !is_inserted)
             {
                 LOG_TRACE(log, "Skipping inserting block with {} rows", rows);
@@ -1425,7 +1446,7 @@ void addFoundRowAll(
 {
     if constexpr (add_missing)
         added.applyLazyDefaults();
-
+    std::cerr << "addFoundRowAll " << multiple_disjuncts << "\n\n\n\n";
     if constexpr (multiple_disjuncts)
     {
         std::unique_ptr<std::vector<KnownRowsHolder<true>::Type>> new_known_rows_ptr;
@@ -1529,11 +1550,12 @@ NO_INLINE size_t joinRightColumns(
             bool row_acceptable = !join_keys.isRowFiltered(i);
             using FindResult = typename KeyGetter::FindResult;
             auto find_result = row_acceptable ? key_getter_vector[onexpr_idx].findKey(*(mapv[onexpr_idx]), i, pool) : FindResult();
-
+            std::cerr << "FIND RESULT " << find_result.isFound() << "\n\n\n\n";
             if (find_result.isFound())
             {
                 right_row_found = true;
                 auto & mapped = find_result.getMapped();
+                std::cerr << "FEATURE: " << join_features.is_asof_join << ' ' << join_features.is_all_join << ' ' << join_features.is_any_join << '\n';
                 if constexpr (join_features.is_asof_join)
                 {
                     const IColumn & left_asof_key = added_columns.leftAsofKey();
@@ -1554,6 +1576,7 @@ NO_INLINE size_t joinRightColumns(
                 }
                 else if constexpr (join_features.is_all_join)
                 {
+                    std::cerr << "IN ALL JOIN " << "\n\n\n\n";
                     setUsed<need_filter>(added_columns.filter, i);
                     used_flags.template setUsed<join_features.need_flags, multiple_disjuncts>(find_result);
                     auto used_flags_opt = join_features.need_flags ? &used_flags : nullptr;
@@ -1563,6 +1586,7 @@ NO_INLINE size_t joinRightColumns(
                 {
                     /// Use first appeared left key + it needs left columns replication
                     bool used_once = used_flags.template setUsedOnce<join_features.need_flags, multiple_disjuncts>(find_result);
+                    std::cerr << "IN ANY JOIN " << ' ' << used_once << "\n\n\n\n";
                     if (used_once)
                     {
                         auto used_flags_opt = join_features.need_flags ? &used_flags : nullptr;
@@ -1763,13 +1787,20 @@ Block HashJoin::joinBlockImpl(
     bool is_join_get) const
 {
     constexpr JoinFeatures<KIND, STRICTNESS> join_features;
-
+    LOG_INFO(log, "joinBlockImpl\n");
     std::vector<JoinOnKeyColumns> join_on_keys;
     const auto & onexprs = table_join->getClauses();
     for (size_t i = 0; i < onexprs.size(); ++i)
     {
         const auto & key_names = !is_join_get ? onexprs[i].key_names_left : onexprs[i].key_names_right;
         join_on_keys.emplace_back(block, key_names, onexprs[i].condColumnNames().first, key_sizes[i]);
+    }
+    LOG_INFO(log, "SIZE OF join_on_keys {}\n", join_on_keys.size());
+    for (const auto& key : join_on_keys) {
+        LOG_INFO(log, "KEY:\n");
+        for (const auto& name : key.key_names) {
+            LOG_INFO(log, "NAME {}\n", name);
+        }
     }
     size_t existing_columns = block.columns();
 
@@ -2010,6 +2041,7 @@ void HashJoin::checkTypesOfKeys(const Block & block) const
 
 void HashJoin::joinBlock(Block & block, ExtraBlockPtr & not_processed)
 {
+    LOG_INFO(log, "joinBlock\n");
     if (!data)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot join after data has been released");
 
